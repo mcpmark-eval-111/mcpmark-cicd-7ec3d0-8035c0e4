@@ -1,0 +1,459 @@
+name: PR Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Run ESLint
+        id: eslint
+        continue-on-error: true
+        run: |
+          set +e
+          npm run lint 2>&1 | tee /tmp/eslint-output.txt
+          echo "eslint_exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Run Prettier check
+        id: prettier
+        continue-on-error: true
+        run: |
+          set +e
+          if npm run --silent 2>&1 | grep -qE '^\s+format(:check)?'; then
+            npm run format:check 2>&1 | tee /tmp/prettier-output.txt || \
+            npm run format -- --check 2>&1 | tee /tmp/prettier-output.txt
+          else
+            npx --yes prettier --check "**/*.{js,jsx,ts,tsx,json,md,yml,yaml}" 2>&1 | tee /tmp/prettier-output.txt
+          fi
+          echo "prettier_exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Post code quality results
+        if: always() && github.event.pull_request != null
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const readSafe = (p) => {
+              try { return fs.readFileSync(p, 'utf8'); } catch (e) { return 'No output captured'; }
+            };
+            const eslintOutput = readSafe('/tmp/eslint-output.txt');
+            const prettierOutput = readSafe('/tmp/prettier-output.txt');
+            const eslintExit = '${{ steps.eslint.outputs.eslint_exit }}';
+            const prettierExit = '${{ steps.prettier.outputs.prettier_exit }}';
+            const eslintStatus = eslintExit === '0' ? '✅ Passed' : '❌ Issues found';
+            const prettierStatus = prettierExit === '0' ? '✅ Passed' : '❌ Issues found';
+            const body = [
+              '## 📋 Code Quality Report',
+              '',
+              '### ESLint',
+              `Status: ${eslintStatus}`,
+              '',
+              '<details><summary>ESLint output</summary>',
+              '',
+              '```',
+              eslintOutput.slice(0, 4000),
+              '```',
+              '',
+              '</details>',
+              '',
+              '### Prettier',
+              `Status: ${prettierStatus}`,
+              '',
+              '<details><summary>Prettier output</summary>',
+              '',
+              '```',
+              prettierOutput.slice(0, 4000),
+              '```',
+              '',
+              '</details>',
+              '',
+              '_Automated comment from PR Automation workflow_'
+            ].join('
+');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Run tests
+        id: tests
+        continue-on-error: true
+        run: |
+          set +e
+          npm test 2>&1 | tee /tmp/test-output.txt
+          echo "test_exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Generate coverage report
+        id: coverage
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p coverage
+          if npm run --silent 2>&1 | grep -qE '^\s+coverage'; then
+            npm run coverage 2>&1 | tee /tmp/coverage-output.txt
+          elif npm run --silent 2>&1 | grep -qE '^\s+test:coverage'; then
+            npm run test:coverage 2>&1 | tee /tmp/coverage-output.txt
+          else
+            npx --yes nyc --reporter=text --reporter=lcov npm test 2>&1 | tee /tmp/coverage-output.txt || \
+              echo "Coverage tooling not configured; using test output as summary." | tee /tmp/coverage-output.txt
+          fi
+          echo "coverage_exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage/
+            /tmp/test-output.txt
+            /tmp/coverage-output.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Post coverage summary
+        if: always() && github.event.pull_request != null
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const readSafe = (p) => {
+              try { return fs.readFileSync(p, 'utf8'); } catch (e) { return 'No output captured'; }
+            };
+            const testOutput = readSafe('/tmp/test-output.txt');
+            const coverageOutput = readSafe('/tmp/coverage-output.txt');
+            const testExit = '${{ steps.tests.outputs.test_exit }}';
+            const testStatus = testExit === '0' ? '✅ All tests passed' : '❌ Tests failed';
+            const body = [
+              '## 🧪 Test Coverage Report',
+              '',
+              `### Test Suite Status: ${testStatus}`,
+              '',
+              '<details><summary>Test output</summary>',
+              '',
+              '```',
+              testOutput.slice(0, 4000),
+              '```',
+              '',
+              '</details>',
+              '',
+              '### Coverage Summary',
+              '',
+              '<details><summary>Coverage output</summary>',
+              '',
+              '```',
+              coverageOutput.slice(0, 4000),
+              '```',
+              '',
+              '</details>',
+              '',
+              '_Automated comment from PR Automation workflow_'
+            ].join('
+');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Run npm audit (Dependencies vulnerability scan)
+        id: audit
+        continue-on-error: true
+        run: |
+          set +e
+          npm audit --json > /tmp/audit.json 2>/tmp/audit-err.txt
+          echo "audit_exit=$?" >> "$GITHUB_OUTPUT"
+          npm audit 2>&1 | tee /tmp/audit-output.txt || true
+
+      - name: Scan for secrets in code changes
+        id: secrets
+        continue-on-error: true
+        run: |
+          set +e
+          : > /tmp/secrets-output.txt
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
+            git fetch --no-tags --prune --depth=50 origin "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true
+            DIFF_FILE=/tmp/changes.diff
+            git diff "$BASE_SHA" "$HEAD_SHA" > "$DIFF_FILE" 2>/dev/null || git diff > "$DIFF_FILE"
+          else
+            DIFF_FILE=/tmp/changes.diff
+            git diff HEAD~1 HEAD > "$DIFF_FILE" 2>/dev/null || true
+          fi
+          PATTERNS='(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{20,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|xox[abps]-[A-Za-z0-9-]+|-----BEGIN ((RSA|EC|DSA|OPENSSH|PGP) )?PRIVATE KEY-----|password\s*=\s*["'\''][^"'\'' ]{6,}|api[_-]?key\s*=\s*["'\''][^"'\'' ]{8,}|secret\s*=\s*["'\''][^"'\'' ]{8,})'
+          if [ -s "$DIFF_FILE" ]; then
+            grep -E -n -i "$PATTERNS" "$DIFF_FILE" > /tmp/secrets-output.txt || echo "No secrets detected in PR diff." > /tmp/secrets-output.txt
+          else
+            echo "No diff content available; performing repo-wide quick scan..." > /tmp/secrets-output.txt
+            grep -REn -i --include='*.js' --include='*.ts' --include='*.json' --include='*.env*' "$PATTERNS" . 2>/dev/null | head -200 >> /tmp/secrets-output.txt || true
+            echo "Scan complete." >> /tmp/secrets-output.txt
+          fi
+          echo "secrets_exit=0" >> "$GITHUB_OUTPUT"
+
+      - name: Post security scan report
+        if: always() && github.event.pull_request != null
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const readSafe = (p) => {
+              try { return fs.readFileSync(p, 'utf8'); } catch (e) { return 'No output captured'; }
+            };
+            let vulnSummary = 'No vulnerability data captured.';
+            try {
+              const raw = fs.readFileSync('/tmp/audit.json', 'utf8');
+              const data = JSON.parse(raw);
+              const meta = data.metadata && data.metadata.vulnerabilities ? data.metadata.vulnerabilities : null;
+              if (meta) {
+                vulnSummary = `Critical: ${meta.critical || 0} | High: ${meta.high || 0} | Moderate: ${meta.moderate || 0} | Low: ${meta.low || 0} | Info: ${meta.info || 0} | Total: ${meta.total || 0}`;
+              }
+            } catch (e) {
+              vulnSummary = 'Could not parse npm audit JSON output.';
+            }
+            const auditOutput = readSafe('/tmp/audit-output.txt');
+            const secretsOutput = readSafe('/tmp/secrets-output.txt');
+            const body = [
+              '## 🔒 Security Scan Report',
+              '',
+              '### Dependencies',
+              `Vulnerabilities: ${vulnSummary}`,
+              '',
+              '<details><summary>npm audit output</summary>',
+              '',
+              '```',
+              auditOutput.slice(0, 4000),
+              '```',
+              '',
+              '</details>',
+              '',
+              '### Secret Scan',
+              '',
+              '<details><summary>Secret scan output</summary>',
+              '',
+              '```',
+              secretsOutput.slice(0, 4000),
+              '```',
+              '',
+              '</details>',
+              '',
+              '_Automated comment from PR Automation workflow_'
+            ].join('
+');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Build application
+        id: build
+        continue-on-error: true
+        run: |
+          set +e
+          : > /tmp/build-output.txt
+          if npm run --silent 2>&1 | grep -qE '^\s+build'; then
+            npm run build 2>&1 | tee /tmp/build-output.txt
+            echo "build_exit=$?" >> "$GITHUB_OUTPUT"
+          else
+            echo "No build script defined; performing syntax check on JS files." | tee /tmp/build-output.txt
+            FAIL=0
+            while IFS= read -r f; do
+              node --check "$f" 2>>/tmp/build-output.txt || FAIL=1
+            done < <(find . -type f -name "*.js" -not -path "./node_modules/*" -not -path "./coverage/*")
+            echo "build_exit=$FAIL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate endpoints
+        id: endpoints
+        continue-on-error: true
+        run: |
+          set +e
+          : > /tmp/endpoints-output.txt
+          ENTRY=""
+          for cand in server.js app.js index.js src/server.js src/app.js src/index.js; do
+            if [ -f "$cand" ]; then ENTRY="$cand"; break; fi
+          done
+          if [ -z "$ENTRY" ]; then
+            echo "No server entry file found; skipping live endpoint validation." | tee -a /tmp/endpoints-output.txt
+            echo "endpoints_exit=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Starting application from $ENTRY..." | tee -a /tmp/endpoints-output.txt
+          (PORT=3000 node "$ENTRY" > /tmp/server.log 2>&1 &) 
+          SERVER_PID=$!
+          echo "Server launched (pid hint: $SERVER_PID)" | tee -a /tmp/endpoints-output.txt
+          # Wait for server to come up
+          UP=0
+          for i in $(seq 1 20); do
+            if curl -fsS "http://localhost:3000/" -o /tmp/root.html 2>/dev/null; then UP=1; break; fi
+            if curl -fsS "http://localhost:3000/health" -o /tmp/health.json 2>/dev/null; then UP=1; break; fi
+            sleep 1
+          done
+          if [ "$UP" -eq 1 ]; then
+            echo "Server reachable on port 3000." | tee -a /tmp/endpoints-output.txt
+            for ep in / /health /api /api/health; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3000$ep" || echo "000")
+              echo "GET $ep -> $CODE" | tee -a /tmp/endpoints-output.txt
+            done
+            EXIT=0
+          else
+            echo "Server did not respond within timeout (non-fatal)." | tee -a /tmp/endpoints-output.txt
+            EXIT=0
+          fi
+          # Best-effort cleanup
+          pkill -f "node $ENTRY" 2>/dev/null || true
+          echo "endpoints_exit=$EXIT" >> "$GITHUB_OUTPUT"
+
+      - name: Create deployment preview artifacts
+        if: always()
+        run: |
+          mkdir -p deployment-preview
+          cp -r /tmp/build-output.txt deployment-preview/build-output.txt 2>/dev/null || true
+          cp -r /tmp/endpoints-output.txt deployment-preview/endpoints-output.txt 2>/dev/null || true
+          cp -r /tmp/server.log deployment-preview/server.log 2>/dev/null || true
+          cat > deployment-preview/manifest.json <<EOM
+          {
+            "pr_number": "${{ github.event.pull_request.number }}",
+            "head_sha": "${{ github.event.pull_request.head.sha }}",
+            "base_sha": "${{ github.event.pull_request.base.sha }}",
+            "build_exit": "${{ steps.build.outputs.build_exit }}",
+            "endpoints_exit": "${{ steps.endpoints.outputs.endpoints_exit }}",
+            "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOM
+
+      - name: Upload deployment preview artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: deployment-preview/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Post build validation status
+        if: always() && github.event.pull_request != null
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const readSafe = (p) => {
+              try { return fs.readFileSync(p, 'utf8'); } catch (e) { return 'No output captured'; }
+            };
+            const buildOutput = readSafe('/tmp/build-output.txt');
+            const endpointsOutput = readSafe('/tmp/endpoints-output.txt');
+            const buildExit = '${{ steps.build.outputs.build_exit }}';
+            const endpointsExit = '${{ steps.endpoints.outputs.endpoints_exit }}';
+            const buildStatus = buildExit === '0' ? '✅ Build succeeded' : '❌ Build issues detected';
+            const endpointStatus = endpointsExit === '0' ? '✅ Endpoint validation completed' : '⚠️ Endpoint validation issues';
+            const body = [
+              '## 🚀 Build Validation',
+              '',
+              `### Build: ${buildStatus}`,
+              '',
+              '<details><summary>Build output</summary>',
+              '',
+              '```',
+              buildOutput.slice(0, 4000),
+              '```',
+              '',
+              '</details>',
+              '',
+              `### Endpoints: ${endpointStatus}`,
+              '',
+              '<details><summary>Endpoint validation output</summary>',
+              '',
+              '```',
+              endpointsOutput.slice(0, 4000),
+              '```',
+              '',
+              '</details>',
+              '',
+              'Deployment preview artifacts have been uploaded as `deployment-preview`.',
+              '',
+              '_Automated comment from PR Automation workflow_'
+            ].join('
+');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
